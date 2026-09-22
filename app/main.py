@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import __version__, analyzer, licenses, policies
+from . import __version__, analyzer, compare, licenses, policies
 from .db import Database, now_iso
 
 DB_PATH = os.environ.get("LICENSEGATE_DB", "/data/licensegate.db")
@@ -48,6 +48,11 @@ class ExceptionRequest(BaseModel):
     distribution: str = Field(default="", description="多制品模式：确认例外所在的制品名称")
 
 
+class CompareRequest(BaseModel):
+    baseline_id: int = Field(..., description="基线（旧版本）项目 ID")
+    current_id: int = Field(..., description="当前（新版本）项目 ID")
+
+
 # ---------------------------------------------------------------------------
 # 核心辅助
 # ---------------------------------------------------------------------------
@@ -79,6 +84,16 @@ def _analyze_project(project_id: int, policy: policies.Policy,
     result["project_id"] = project_id
     result["stored_license"] = project["project_license"]
     return result
+
+
+def _analyze_saved(project_id: int) -> tuple[dict, dict]:
+    """按项目保存时的策略重算结果，同时返回项目行（供对比等功能复用）。"""
+    project = db.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"项目 {project_id} 不存在")
+    policy = _resolve_policy(project["policy_key"])
+    result = _analyze_project(project_id, policy, None)
+    return project, result
 
 
 def _parse_manifest_bytes(raw: bytes, filename: str) -> dict:
@@ -434,6 +449,37 @@ def export_project(project_id: int) -> JSONResponse:
             "Access-Control-Expose-Headers": "Content-Disposition",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# 审查版本对比
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/compare")
+def compare_projects(req: CompareRequest) -> dict:
+    """对比两个已保存项目（基线 vs 当前）的审查结果。
+
+    按 ``name@version`` 对齐依赖，报告新增 / 移除、许可证或结论变化；
+    多制品清单按同名制品分别对比，新增冲突给出当前制品、触发规则与最短路径。
+    """
+    if req.baseline_id == req.current_id:
+        raise HTTPException(status_code=400, detail="基线项目与当前项目不能相同")
+    base_project, base_result = _analyze_saved(req.baseline_id)
+    cur_project, cur_result = _analyze_saved(req.current_id)
+    try:
+        payload = compare.compare_results(
+            baseline=base_result,
+            current=cur_result,
+            baseline_id=req.baseline_id,
+            current_id=req.current_id,
+            baseline_project=base_project,
+            current_project=cur_project,
+        )
+    except compare.CompareError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    payload["generated_at"] = now_iso()
+    return payload
 
 
 # ---------------------------------------------------------------------------

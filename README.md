@@ -11,6 +11,9 @@ JSON 清单，选择项目许可策略后，系统解析完整**传递依赖图*
   在同一张依赖图上分别遍历判定，总览按最严重结论聚合并列出受影响制品；
 * **例外确认**：在页面上对任意冲突包填写理由并"确认例外"（多制品模式可按制品分别确认），
   结果实时重新计算，可随时撤销；
+* **版本对比**：选择两个已保存项目（基线 vs 当前），按 `name@version` 对齐依赖结论，
+  报告新增 / 移除 / 许可证变化 / 结论变化；每个**新增冲突**给出当前制品、触发规则与
+  最短依赖路径，多制品清单按制品分别对比；
 * **JSON 报告导出**：一键下载完整审查报告（多制品时含分制品明细）。
 
 > ⚠️ 内置矩阵覆盖 MIT / Apache-2.0 / BSD / ISC / MPL-2.0 / LGPL-2.1 / LGPL-3.0 /
@@ -187,6 +190,44 @@ pytest -q
 
 ---
 
+## 版本对比（diff）
+
+上传过至少两个项目后，页面"⇄ 版本对比"卡片可任选两个**已保存项目**（基线 vs 当前）进行对比，
+也可直接调用 JSON API：
+
+```bash
+curl -X POST http://localhost:8000/api/diff \
+  -H 'Content-Type: application/json' \
+  -d '{"baseline_id": 1, "current_id": 2}'            # 可选 "policy_key": "strict" 统一策略
+```
+
+对比语义：
+
+* **对齐键**：`name@version`；版本号变化表现为"旧版本移除 + 新版本新增"；
+* **四类差异**：`added`（新增）、`removed`（移除）、`license_changed`（许可证变化，
+  按规范化标识比较，别名写法变化不算）、`verdict_changed`（结论变化，含例外生效/失效）；
+* **新增冲突** `new_conflicts`：当前版本结论为 `deny`/`review` 而基线不是冲突（或不存在）的包，
+  每条携带**当前制品**（`distribution`，单制品为 `null`）、**触发规则**（`rule`）、
+  **最短依赖路径**（`shortest_path`）与升级来源（`change_type`：
+  `added` / `license_changed` / `verdict_changed`）；
+* **已解决冲突** `resolved_conflicts`：基线中的冲突在当前版本消失，`reason` 为
+  `removed`（包被移除）/ `allow`（变为兼容）/ `exception`（已确认例外）；
+* **多制品清单按制品分别对比**：`distributions[]` 中每个同名制品一份独立差异
+  （新增/移除/变化/冲突），制品本身的新增与移除列入 `distributions_added` /
+  `distributions_removed`；顶层 `new_conflicts` 为跨制品汇总（均带制品名），
+  汇总计数按"制品 × 包"计次；单制品与多制品项目之间无法对比（返回 400）；
+* **策略**：默认使用两个项目各自保存的策略（`policy_mismatch: true` 时页面会提示
+  结论差异可能来自策略变化）；传 `policy_key` 可强制两边用同一策略重新计算后再对比；
+* 对比时两个项目**各自已确认的例外照常生效**。
+
+响应为 `licensegate-diff/v1` JSON，页面提供"下载对比 JSON"按钮。
+可配合 [`examples/manifest.example.json`](examples/manifest.example.json)（基线）与
+[`examples/manifest.v2.example.json`](examples/manifest.v2.example.json)（当前）试用：
+依次上传两个清单后，在"版本对比"卡片中选择二者即可看到新增冲突（`缓存库@1.2.0` 新增引入、
+`日志库@0.9.2` 许可证变为 GPL-3.0）与已解决冲突（`加密原语@2.0.0` 升级移除等）。
+
+---
+
 ## 许可策略
 
 策略在兼容矩阵之上叠加两层规则：
@@ -218,6 +259,7 @@ pytest -q
 | `POST` | `/api/projects/{id}/exceptions/{package_id}` | 确认例外（body：`{"note": "理由", "distribution": "制品名"}`），自动重新计算。多制品模式必须带 `distribution`，后端按该制品当前触发规则保存 |
 | `DELETE` | `/api/projects/{id}/exceptions/{package_id}` | 撤销例外，自动重新计算；多制品模式需带查询参数 `?distribution=制品名` |
 | `DELETE` | `/api/projects/{id}` | 删除项目 |
+| `POST` | `/api/diff` | 版本对比（body：`{"baseline_id", "current_id", "policy_key?"}`），返回 `licensegate-diff/v1` 报告：新增/移除/许可证变化/结论变化、带制品+规则+最短路径的新增冲突；多制品按制品分别对比 |
 | `GET` | `/api/projects/{id}/export` | 下载 JSON 报告（`license-report-{id}.json`），多制品时含 `distributions` 分制品明细与总览 |
 | `GET` | `/api/policies` · `/api/licenses` · `/api/health` | 元数据 |
 
@@ -235,14 +277,15 @@ pytest -q
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由与静态页
+│   ├── main.py        # FastAPI 路由与静态页（含 /api/diff 版本对比）
 │   ├── analyzer.py    # 清单解析、依赖图、BFS 最短路径、环检测、单/多制品冲突分析
+│   ├── diff.py        # 版本对比引擎：按 name@version 对齐，差异与新增/已解决冲突
 │   ├── licenses.py    # SPDX 规范化、表达式解析、兼容性矩阵
 │   ├── policies.py    # 四种许可策略与判定叠加规则
 │   └── db.py          # SQLite 持久化（项目 + 按 (包,规则) 维度的例外，含旧库迁移）
-├── static/index.html  # 单页前端（原生 JS，无构建步骤，含制品切换与总览）
-├── examples/          # 示例清单（manifest.example.json 单制品 / manifest.multi.example.json 多制品）
-├── tests/             # 53 个单元/接口测试（含多制品引擎与端到端用例）
+├── static/index.html  # 单页前端（原生 JS，无构建步骤，含制品切换、总览与版本对比）
+├── examples/          # 示例清单（manifest.example.json 单制品 / manifest.v2.example.json 对比用下一版 / manifest.multi.example.json 多制品）
+├── tests/             # 72 个单元/接口测试（含多制品引擎、版本对比与端到端用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

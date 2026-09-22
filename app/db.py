@@ -131,10 +131,18 @@ class Database:
         with self.connect() as conn:
             rows = conn.execute(
                 "SELECT id, name, project_version, project_license, policy_key, "
-                "created_at, updated_at FROM projects ORDER BY id DESC LIMIT ?",
+                "manifest_json, created_at, updated_at FROM projects "
+                "ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        projects = []
+        for row in rows:
+            data = dict(row)
+            manifest = json.loads(data.pop("manifest_json"))
+            # 供前端版本对比选择器提示单/多制品模式
+            data["mode"] = "multi" if manifest.get("distributions") else "single"
+            projects.append(data)
+        return projects
 
     def get_project(self, project_id: int) -> Optional[dict]:
         with self.connect() as conn:

@@ -1,4 +1,4 @@
-"""FastAPI 入口：上传清单、查看分析结果、确认例外、导出 JSON。"""
+"""FastAPI 入口：上传清单、查看分析结果、确认例外、导出 JSON、版本对比。"""
 from __future__ import annotations
 
 import json
@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import __version__, analyzer, licenses, policies
+from . import __version__, analyzer, diff, licenses, policies
 from .db import Database, now_iso
 
 DB_PATH = os.environ.get("LICENSEGATE_DB", "/data/licensegate.db")
@@ -20,7 +20,7 @@ db = Database(DB_PATH)
 app = FastAPI(
     title="LicenseGate",
     description="开源依赖许可审查：解析传递依赖图，按策略与兼容矩阵标出许可证冲突，"
-    "给出最短依赖路径与触发规则，支持例外确认与 JSON 导出。",
+    "给出最短依赖路径与触发规则，支持例外确认、JSON 导出与两个已保存项目的版本对比。",
     version=__version__,
 )
 
@@ -46,6 +46,15 @@ class ReanalyzeRequest(BaseModel):
 class ExceptionRequest(BaseModel):
     note: str = Field(default="", max_length=2000, description="例外理由 / 审批备注")
     distribution: str = Field(default="", description="多制品模式：确认例外所在的制品名称")
+
+
+class DiffRequest(BaseModel):
+    baseline_id: int = Field(..., description="基线项目 ID")
+    current_id: int = Field(..., description="当前项目 ID")
+    policy_key: Optional[str] = Field(
+        default=None,
+        description="可选：强制两个项目用同一策略重新计算；缺省使用各自保存的策略",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +315,68 @@ def delete_project(project_id: int) -> dict:
     if not db.delete_project(project_id):
         raise HTTPException(status_code=404, detail="项目不存在")
     return {"deleted": project_id}
+
+
+# ---------------------------------------------------------------------------
+# 版本对比
+# ---------------------------------------------------------------------------
+
+
+def _diff_project_meta(project: dict, policy: policies.Policy) -> dict:
+    return {
+        "id": project["id"],
+        "name": project["name"],
+        "version": project["project_version"],
+        "project_license": project["project_license"],
+        "policy_key": policy.key,
+        "policy_name": policy.name,
+        "mode": "multi" if project["manifest"].get("distributions") else "single",
+    }
+
+
+@app.post("/api/diff")
+def diff_projects(req: DiffRequest) -> dict:
+    """对比两个已保存项目（基线 vs 当前）的审查结果。
+
+    按 ``name@version`` 对齐依赖结论，报告新增 / 移除 / 许可证变化 / 结论变化；
+    每个新增冲突携带当前制品、触发规则与最短依赖路径。
+    多制品清单按制品名分别对比；单制品与多制品项目之间无法对比（400）。
+    """
+    if req.baseline_id == req.current_id:
+        raise HTTPException(status_code=400, detail="基线与当前不能是同一个项目")
+    baseline = db.get_project(req.baseline_id)
+    if baseline is None:
+        raise HTTPException(status_code=404, detail=f"基线项目 {req.baseline_id} 不存在")
+    current = db.get_project(req.current_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail=f"当前项目 {req.current_id} 不存在")
+
+    if req.policy_key:
+        # 统一策略：消除策略差异，只比较清单本身的变化
+        base_policy = cur_policy = _resolve_policy(req.policy_key)
+        policy_mismatch = False
+    else:
+        base_policy = _resolve_policy(baseline["policy_key"])
+        cur_policy = _resolve_policy(current["policy_key"])
+        policy_mismatch = baseline["policy_key"] != current["policy_key"]
+
+    base_result = _analyze_project(req.baseline_id, base_policy, None)
+    cur_result = _analyze_project(req.current_id, cur_policy, None)
+    try:
+        report = diff.compare_results(base_result, cur_result)
+    except diff.DiffError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    report.update(
+        {
+            "report_format": "licensegate-diff/v1",
+            "generated_at": now_iso(),
+            "baseline": _diff_project_meta(baseline, base_policy),
+            "current": _diff_project_meta(current, cur_policy),
+            "policy_mismatch": policy_mismatch,
+        }
+    )
+    return report
 
 
 @app.get("/api/projects/{project_id}/export")

@@ -158,6 +158,63 @@
     <div id="history" style="margin-top:14px"></div>
   </div>
 
+  <!-- 版本对比 -->
+  <div class="card">
+    <h2>⇄ 版本对比（选择两个已保存项目）</h2>
+    <div class="row">
+      <div class="field">
+        <label for="diffBase">基线项目</label>
+        <select id="diffBase"></select>
+      </div>
+      <div class="field">
+        <label for="diffCurrent">当前项目</label>
+        <select id="diffCurrent"></select>
+      </div>
+      <div class="field">
+        <label for="diffPolicy">统一策略（可选）</label>
+        <select id="diffPolicy"></select>
+        <div class="hint">缺省使用两个项目各自保存的策略</div>
+      </div>
+      <div class="field" style="flex:0 0 auto; min-width:120px">
+        <button id="diffBtn" disabled>开始对比</button>
+      </div>
+    </div>
+    <div class="hint" style="margin-top:8px">按 <span class="mono">name@version</span> 对齐依赖结论，报告新增 / 移除 / 许可证与结论变化；每个新增冲突给出当前制品、触发规则与最短路径；多制品清单按制品分别对比。</div>
+  </div>
+
+  <!-- 对比结果 -->
+  <div id="diffResults" class="hidden">
+    <div class="card">
+      <div class="toolbar">
+        <div class="proj-title" id="diffTitle"></div>
+        <span style="flex:1"></span>
+        <button id="diffDownload" class="ghost">⬇ 下载对比 JSON</button>
+      </div>
+      <div class="chips" id="diffChips"></div>
+      <div class="stats" id="diffStats"></div>
+    </div>
+
+    <div class="card">
+      <h2 class="section-title">新增冲突 <span class="count" id="diffConflictCount">0</span></h2>
+      <div style="overflow-x:auto">
+        <table id="diffConflictTable">
+          <thead><tr id="diffConflictHead"></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="hint" id="diffNoConflict" style="display:none;margin-top:10px">🎉 当前版本没有新增冲突。</p>
+    </div>
+
+    <div class="card" id="diffDetailCard">
+      <details open>
+        <summary class="section-title" style="display:inline-flex">变化明细</summary>
+        <div id="diffDetailBody" style="margin-top:10px"></div>
+      </details>
+    </div>
+
+    <div id="diffDists"></div>
+  </div>
+
   <!-- 结果区 -->
   <div id="results" class="hidden">
     <div class="card">
@@ -239,6 +296,8 @@ async function init(){
   const pSel = $("#policy");
   pSel.innerHTML = ps.map(p=>`<option value="${p.key}">${esc(p.name)}</option>`).join("");
   pSel.value = defKey;
+  $("#diffPolicy").innerHTML = `<option value="">（各自存储的策略）</option>` +
+    ps.map(p=>`<option value="${p.key}">${esc(p.name)}</option>`).join("");
   const refreshLic = () => {
     const p = ps.find(x=>x.key===pSel.value);
     $("#policyDesc").textContent = p.description;
@@ -266,12 +325,32 @@ function updateLicSelectorState(){
 async function loadHistory(){
   try {
     const data = await api("/api/projects");
+    refreshDiffSelectors(data.projects);
     if(!data.projects.length){ $("#history").innerHTML=""; return; }
     $("#history").innerHTML = "历史项目：" + data.projects.slice(0,10)
       .map(p=>`<a data-id="${p.id}">#${p.id} ${esc(p.name)}</a>`).join("");
     $("#history").querySelectorAll("a").forEach(a=>a.addEventListener("click",()=>loadProject(a.dataset.id)));
   } catch {}
 }
+
+// ---------- 版本对比 ----------
+function refreshDiffSelectors(projects){
+  const prevB = $("#diffBase").value, prevC = $("#diffCurrent").value;
+  const opts = projects.map(p=>
+    `<option value="${p.id}">#${p.id} ${esc(p.name)} ${esc(p.project_version||"")}${p.mode==="multi"?" · 多制品":" · 单制品"}</option>`);
+  const placeholder = `<option value="">（选择已保存项目）</option>`;
+  $("#diffBase").innerHTML = placeholder + opts.join("");
+  $("#diffCurrent").innerHTML = placeholder + opts.join("");
+  if(projects.some(p=>String(p.id)===prevB)) $("#diffBase").value = prevB;
+  if(projects.some(p=>String(p.id)===prevC)) $("#diffCurrent").value = prevC;
+  refreshDiffControls();
+}
+function refreshDiffControls(){
+  const b=$("#diffBase").value, c=$("#diffCurrent").value;
+  $("#diffBtn").disabled = !(b && c && b!==c);
+}
+$("#diffBase").addEventListener("change", refreshDiffControls);
+$("#diffCurrent").addEventListener("change", refreshDiffControls);
 
 // ---------- 文件选择 ----------
 const drop=$("#drop"), fileInput=$("#file");
@@ -363,6 +442,170 @@ async function revokeException(pkgId, distName){
 $("#exportBtn").addEventListener("click", ()=>{
   if(currentProjectId) window.open(`/api/projects/${currentProjectId}/export`, "_blank");
 });
+
+// ---------- 版本对比：执行与渲染 ----------
+const CHANGE_TYPE_TEXT = {added:"新增依赖", license_changed:"许可证变化", verdict_changed:"结论变化"};
+const REASON_TEXT = {removed:"包已移除", allow:"变为兼容", exception:"已确认例外"};
+let lastDiffReq = null, lastDiffData = null;
+
+$("#diffBtn").addEventListener("click", async ()=>{
+  clearError();
+  const body = {baseline_id:Number($("#diffBase").value), current_id:Number($("#diffCurrent").value)};
+  const pk = $("#diffPolicy").value;
+  if(pk) body.policy_key = pk;
+  $("#diffBtn").disabled = true;
+  try {
+    const data = await api("/api/diff", {method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(body)});
+    lastDiffReq = body; lastDiffData = data;
+    renderDiff(data);
+  } catch(e){ showError(e.message); }
+  finally { $("#diffBtn").disabled = false; }
+});
+
+$("#diffDownload").addEventListener("click", ()=>{
+  if(!lastDiffData) return;
+  const blob = new Blob([JSON.stringify(lastDiffData, null, 2)], {type:"application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `license-diff-${lastDiffReq.baseline_id}-vs-${lastDiffReq.current_id}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+function diffConflictRow(c, showDist){
+  return `<tr>
+    <td><strong>${esc(c.name)}</strong><div class="hint mono">${esc(c.version)}</div></td>
+    ${showDist?`<td><span class="chip info">${esc(c.distribution||"—")}</span></td>`:""}
+    <td><span class="lic-tag">${esc(c.license_raw||"未声明")}</span>
+      ${c.license && c.license!==c.license_raw && c.license!=="NOASSERTION"?`<div class="hint">规范化：${esc(c.license)}</div>`:""}
+      ${c.license==="NOASSERTION"?'<div class="hint">⚠ 无法识别</div>':""}</td>
+    <td>${badge(c.verdict)}
+      <span class="hint">（${CHANGE_TYPE_TEXT[c.change_type]||c.change_type}${c.baseline_verdict?`，基线结论：${VERDICT_TEXT[c.baseline_verdict]||c.baseline_verdict}`:""}）</span>
+      <div class="rule" style="margin-top:5px">触发规则：<code>${esc(c.rule)}</code></div>
+      <div class="msg">${esc(c.message)}</div>
+      <details><summary>最短依赖路径（深度 ${c.depth??"—"}）</summary>
+        <div class="path mono" style="margin-top:5px">${renderPath(c.shortest_path)}</div>
+      </details>
+    </td>
+  </tr>`;
+}
+
+function diffSection(title, inner){
+  return `<details open style="margin-bottom:12px"><summary style="font-weight:600;font-size:13px">${title}</summary>
+    <div style="overflow-x:auto;margin-top:6px">${inner}</div></details>`;
+}
+
+function pkgRefTable(list, showDist){
+  return `<table><thead><tr><th>包</th>${showDist?"<th>制品</th>":""}<th>许可证</th><th>结论</th><th>规则</th></tr></thead>
+  <tbody>${list.map(p=>`<tr>
+    <td class="mono">${esc(p.id)}</td>
+    ${showDist?`<td>${esc(p.distribution||"—")}</td>`:""}
+    <td><span class="lic-tag">${esc(p.license_raw||"未声明")}</span></td>
+    <td>${badge(p.verdict)}</td>
+    <td class="mono" style="color:var(--muted);font-size:11px">${esc(p.rule)}</td>
+  </tr>`).join("")}</tbody></table>`;
+}
+
+// 单个包集合（单制品整体 / 多制品的某个制品）的变化明细
+function diffDetailHtml(d, showDist){
+  const distTh = showDist ? "<th>制品</th>" : "";
+  const distTd = p => showDist ? `<td>${esc(p.distribution||"—")}</td>` : "";
+  const parts = [];
+  if(d.resolved_conflicts && d.resolved_conflicts.length){
+    parts.push(diffSection(`已解决冲突（${d.resolved_conflicts.length}）`, `
+      <table><thead><tr><th>包</th>${distTh}<th>基线结论</th><th>当前状态</th><th>基线触发规则</th></tr></thead>
+      <tbody>${d.resolved_conflicts.map(r=>`<tr>
+        <td class="mono">${esc(r.id)}</td>${distTd(r)}
+        <td>${badge(r.baseline_verdict)}</td>
+        <td>${r.current_verdict?badge(r.current_verdict)+" ":""}<span class="hint">${REASON_TEXT[r.reason]||r.reason}</span></td>
+        <td class="mono" style="color:var(--muted);font-size:11px">${esc(r.baseline_rule)}</td>
+      </tr>`).join("")}</tbody></table>`));
+  }
+  if(d.license_changed && d.license_changed.length){
+    parts.push(diffSection(`许可证变化（${d.license_changed.length}）`, `
+      <table><thead><tr><th>包</th>${distTh}<th>许可证变化</th><th>结论变化</th></tr></thead>
+      <tbody>${d.license_changed.map(c=>`<tr>
+        <td class="mono">${esc(c.id)}</td>${distTd(c)}
+        <td><span class="lic-tag">${esc(c.baseline_license||"未声明")}</span> → <span class="lic-tag">${esc(c.current_license||"未声明")}</span></td>
+        <td>${badge(c.baseline_verdict)} → ${badge(c.current_verdict)}</td>
+      </tr>`).join("")}</tbody></table>`));
+  }
+  if(d.verdict_changed && d.verdict_changed.length){
+    parts.push(diffSection(`结论变化（${d.verdict_changed.length}）`, `
+      <table><thead><tr><th>包</th>${distTh}<th>结论变化</th><th>规则变化</th></tr></thead>
+      <tbody>${d.verdict_changed.map(c=>`<tr>
+        <td class="mono">${esc(c.id)}</td>${distTd(c)}
+        <td>${badge(c.baseline_verdict)} → ${badge(c.current_verdict)}</td>
+        <td class="mono" style="color:var(--muted);font-size:11px">${esc(c.baseline_rule)} → ${esc(c.current_rule)}</td>
+      </tr>`).join("")}</tbody></table>`));
+  }
+  if(d.added && d.added.length)
+    parts.push(diffSection(`新增依赖（${d.added.length}）`, pkgRefTable(d.added, showDist)));
+  if(d.removed && d.removed.length)
+    parts.push(diffSection(`移除依赖（${d.removed.length}）`, pkgRefTable(d.removed, showDist)));
+  return parts.length ? parts.join("") : '<p class="hint">两个版本的依赖结论完全一致。</p>';
+}
+
+function renderDiff(data){
+  $("#diffResults").classList.remove("hidden");
+  const multi = data.mode === "multi";
+  const b = data.baseline, c = data.current;
+  $("#diffTitle").innerHTML = `#${b.id} ${esc(b.name)} ${esc(b.version||"")} → #${c.id} ${esc(c.name)} ${esc(c.version||"")}` +
+    `<span>${multi?"多制品对比":"单制品对比"} · 策略：${esc(b.policy_name)}${b.policy_key!==c.policy_key?" / "+esc(c.policy_name):""}</span>`;
+
+  const chips = [];
+  if(data.policy_mismatch)
+    chips.push(`<span class="chip warn">两个项目保存的策略不同（${esc(b.policy_key)} vs ${esc(c.policy_key)}），结论差异可能来自策略变化；可选择统一策略重新对比</span>`);
+  if(multi){
+    if(data.distributions_added.length)
+      chips.push(`<span class="chip info">新增制品：${data.distributions_added.map(d=>esc(d.name)).join("、")}</span>`);
+    if(data.distributions_removed.length)
+      chips.push(`<span class="chip warn">移除制品：${data.distributions_removed.map(d=>esc(d.name)).join("、")}</span>`);
+  }
+  if(!chips.length) chips.push(`<span class="chip">策略一致（${esc(b.policy_name)}），差异仅来自清单变化</span>`);
+  $("#diffChips").innerHTML = chips.join("");
+
+  const s = data.summary;
+  $("#diffStats").innerHTML = [
+    [s.added,"新增依赖",""],[s.removed,"移除依赖",""],
+    [s.license_changed,"许可证变化",""],[s.verdict_changed,"结论变化",""],
+    [s.new_conflicts,"新增冲突","deny"],[s.resolved_conflicts,"解决冲突","allow"],
+  ].map(([n,l,cls])=>`<div class="stat ${cls}"><div class="num">${n}</div><div class="lbl">${l}</div></div>`).join("");
+
+  // 新增冲突（多制品为跨制品汇总，带制品列）
+  const conflicts = data.new_conflicts || [];
+  $("#diffConflictCount").textContent = conflicts.length;
+  $("#diffNoConflict").style.display = conflicts.length ? "none" : "block";
+  $("#diffConflictHead").innerHTML =
+    `<th style="width:150px">包 / 版本</th>` +
+    (multi?`<th style="width:110px">当前制品</th>`:"") +
+    `<th style="width:130px">许可证</th><th>结论 / 触发规则 / 最短依赖路径</th>`;
+  $("#diffConflictTable tbody").innerHTML = conflicts.map(c=>diffConflictRow(c, multi)).join("");
+
+  if(multi){
+    // 每个共同制品一张卡片：制品内新增冲突 + 完整变化明细
+    $("#diffDetailCard").classList.add("hidden");
+    $("#diffDists").innerHTML = data.distributions.map(d=>{
+      const ds = d.summary;
+      return `<div class="card">
+        <h2 class="section-title" style="font-size:15px">制品「${esc(d.name)}」
+          <span class="hint" style="font-weight:400">项目许可证 ${esc(d.baseline_license)} → ${esc(d.current_license)} ·
+          +${ds.added} / -${ds.removed} / 许可证变化 ${ds.license_changed} / 结论变化 ${ds.verdict_changed} / 新增冲突 ${ds.new_conflicts}</span>
+        </h2>
+        ${d.new_conflicts.length ? `<div style="overflow-x:auto;margin-bottom:10px"><table>
+          <thead><tr><th style="width:150px">包 / 版本</th><th style="width:130px">许可证</th><th>结论 / 触发规则 / 最短依赖路径</th></tr></thead>
+          <tbody>${d.new_conflicts.map(c=>diffConflictRow(c,false)).join("")}</tbody></table></div>` : ""}
+        ${diffDetailHtml(d, false)}
+      </div>`;
+    }).join("");
+  } else {
+    $("#diffDetailCard").classList.remove("hidden");
+    $("#diffDetailBody").innerHTML = diffDetailHtml(data, false);
+    $("#diffDists").innerHTML = "";
+  }
+  $("#diffResults").scrollIntoView({behavior:"smooth", block:"start"});
+}
 
 // ---------- 渲染 ----------
 function renderPath(path){
